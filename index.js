@@ -71,57 +71,60 @@ function parseMessage(text) {
   return { amount, coins: matchedCoins };
 }
 
-async function fetchPrices(ids) {
-  const res = await fetch(
-    `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ids.join(',')}`
-  );
-  const arr = await res.json();
+// ---------- حافظه موقت قیمت‌ها ----------
+const ALL_IDS = [...new Set(Object.values(ALIASES))];
+let priceCache = {};
+let usdToTomanRate = null;
+
+async function refreshPriceCache() {
+  try {
+    const res = await fetch(
+      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ALL_IDS.join(',')}`
+    );
+    const arr = await res.json();
+    if (Array.isArray(arr)) {
+      const map = {};
+      arr.forEach(c => { map[c.id] = c; });
+      priceCache = map;
+      console.log('Price cache updated:', new Date().toLocaleTimeString());
+    }
+  } catch (e) {
+    console.error('Price cache refresh error:', e.message);
+  }
+}
+
+async function refreshTomanRate() {
+  try {
+    const res = await fetch('https://api.nobitex.ir/market/stats?srcCurrency=usdt&dstCurrency=rls');
+    const data = await res.json();
+    const rial = parseFloat(data?.stats?.['usdt-rls']?.latest);
+    if (rial) {
+      usdToTomanRate = rial / 10; // ریال به تومان
+      console.log('Toman rate updated:', usdToTomanRate);
+    }
+  } catch (e) {
+    console.error('Toman rate refresh error:', e.message);
+  }
+}
+
+function refreshAll() {
+  refreshPriceCache();
+  refreshTomanRate();
+}
+
+refreshAll(); // یک بار موقع استارت
+setInterval(refreshAll, 60 * 1000); // بعدش هر ۶۰ ثانیه
+
+function fetchPrices(ids) {
   const map = {};
-  arr.forEach(c => { map[c.id] = c; });
+  ids.forEach(id => { if (priceCache[id]) map[id] = priceCache[id]; });
   return map;
 }
 
-async function buildChartUrl(id, isUp) {
-  try {
-    const res = await fetch(
-      `https://api.coingecko.com/api/v3/coins/${id}/market_chart?vs_currency=usd&days=1`
-    );
-    const data = await res.json();
-    const points = data.prices || [];
-    if (points.length === 0) return null;
-
-    // sample down to ~40 points so the URL doesn't get too long
-    const step = Math.max(1, Math.floor(points.length / 40));
-    const sampled = points.filter((_, idx) => idx % step === 0).map(p => p[1]);
-
-    const color = isUp ? '#4ADE80' : '#FF6B6B';
-    const chartConfig = {
-      type: 'line',
-      data: {
-        labels: sampled.map(() => ''),
-        datasets: [{
-          data: sampled,
-          borderColor: color,
-          backgroundColor: color + '22',
-          fill: true,
-          borderWidth: 3,
-          pointRadius: 0,
-          tension: 0.3
-        }]
-      },
-      options: {
-        plugins: { legend: { display: false } },
-        scales: { x: { display: false }, y: { display: false } },
-        layout: { padding: 0 }
-      }
-    };
-
-    const encoded = encodeURIComponent(JSON.stringify(chartConfig));
-    return `https://quickchart.io/chart?c=${encoded}&width=600&height=300&backgroundColor=%2310152a&devicePixelRatio=2`;
-  } catch (e) {
-    console.error('Chart build error:', e.message);
-    return null;
-  }
+function tomanStr(usdValue) {
+  if (!usdToTomanRate) return null;
+  const toman = usdValue * usdToTomanRate;
+  return toman.toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 
 bot.on('text', async (ctx) => {
@@ -135,7 +138,7 @@ bot.on('text', async (ctx) => {
 
   try {
     const uniqueIds = [...new Set(coins)];
-    const prices = await fetchPrices(uniqueIds);
+    const prices = fetchPrices(uniqueIds);
 
     if (coins.length === 1) {
       const id = coins[0];
@@ -151,25 +154,18 @@ bot.on('text', async (ctx) => {
       const volume = data.total_volume ? `$${Math.round(data.total_volume).toLocaleString()}` : 'نامشخص';
       const rank = data.market_cap_rank ? `#${data.market_cap_rank}` : '-';
       const name = NAMES_FA[id] || data.name;
+      const toman = tomanStr(usdValue);
 
       const caption =
         `💰 <b>${name}</b> (${data.symbol.toUpperCase()}) ${rank}\n\n` +
         `💵 قیمت: <b>$${data.current_price.toLocaleString(undefined, { maximumFractionDigits: 6 })}</b>\n` +
         (amount !== 1 ? `🧮 ${amount} ${name} = <b>$${usdValue.toLocaleString(undefined, { maximumFractionDigits: 6 })}</b>\n` : '') +
+        (toman ? `💴 معادل: <b>${toman} تومان</b>\n` : '') +
         `${arrow} تغییر ۲۴ ساعته: <b>${changeStr}</b>\n` +
         `🏦 ارزش بازار: ${marketCap}\n` +
         `📊 حجم معاملات: ${volume}`;
 
-      const chartUrl = await buildChartUrl(id, isUp);
-
-      if (chartUrl) {
-        await ctx.replyWithMediaGroup([
-          { type: 'photo', media: data.image, caption, parse_mode: 'HTML' },
-          { type: 'photo', media: chartUrl }
-        ]);
-      } else {
-        await ctx.replyWithPhoto(data.image, { caption, parse_mode: 'HTML' });
-      }
+      await ctx.reply(caption, { parse_mode: 'HTML' });
     } else {
       const [fromId, toId] = coins;
       const fromData = prices[fromId];
@@ -179,14 +175,17 @@ bot.on('text', async (ctx) => {
       const result = (amount * fromData.current_price) / toData.current_price;
       const fromName = NAMES_FA[fromId] || fromData.name;
       const toName = NAMES_FA[toId] || toData.name;
+      const usdValue = amount * fromData.current_price;
+      const toman = tomanStr(usdValue);
 
       const caption =
         `🔄 <b>تبدیل ارز</b>\n\n` +
         `💱 ${amount} ${fromName} = <b>${result.toLocaleString(undefined, { maximumFractionDigits: 8 })} ${toName}</b>\n\n` +
+        (toman ? `💴 معادل: <b>${toman} تومان</b>\n\n` : '') +
         `💵 هر ${fromName} = $${fromData.current_price.toLocaleString()}\n` +
         `💵 هر ${toName} = $${toData.current_price.toLocaleString()}`;
 
-      await ctx.replyWithPhoto(fromData.image, { caption, parse_mode: 'HTML' });
+      await ctx.reply(caption, { parse_mode: 'HTML' });
     }
   } catch (err) {
     console.error('Price fetch error:', err.message);
